@@ -25,6 +25,8 @@ import GHC.Types (Any)
 import System.Posix (EpochTime, epochTime)
 import Unsafe.Coerce (unsafeCoerce)
 import Text.Read (readMaybe)
+import Data.Bool (bool)
+import Control.Monad (unless)
 
 type CacheRef =  IORef (LRU.LRU Text ServiceCache)
 
@@ -66,6 +68,7 @@ deriveJSON defaultOptions ''ServiceResponse
 initCache :: IO CacheRef
 initCache = newIORef $ LRU.newLRU (Just 100)
 
+-- fetch from cache or perform api call and cache successful result
 serviceCall :: ServiceRequest -> CacheRef -> IO (Either ServiceError ServiceResponse)
 serviceCall req@(ServiceRequest title author contains count op) cache =
     readFromCache
@@ -76,9 +79,11 @@ serviceCall req@(ServiceRequest title author contains count op) cache =
               in fn
 
         writeToCache response = do
-            ct <- epochTime
-            let value = ServiceCache ct (unsafeCoerce response) op
-            insertIntoCache value $> (Right response)
+            unless (Prelude.null $ articles response) $ do
+                ct <- epochTime
+                let value = ServiceCache ct (unsafeCoerce response) op
+                insertIntoCache value
+            pure $ Right $ response
 
         readFromCache = do
           lru <- readIORef cache
@@ -101,11 +106,12 @@ serviceCall req@(ServiceRequest title author contains count op) cache =
         
         cacheTimeLimit = fromMaybe 7200 $ readMaybe =<< (unsafePerformIO $ lookupEnv "CACHE_TTL") -- default cache ttl is 2 hours
 
-          
+-- call gnews.io    
 callNewsService :: ServiceRequest -> IO (Either ServiceError ServiceResponse)
 callNewsService req@(ServiceRequest _ _ _ _ op) = do
-    baseReq  <- parseRequest $ serviceUrl (unpack op)
-    response <- try $! httpLBS $ modifyRequest baseReq
+    baseReq  <- modifyRequest <$> (parseRequest $ serviceUrl (unpack op))
+    putStrLn $ show baseReq
+    response <- try $! httpLBS baseReq
     case response of
         Left (e :: SomeException) ->
             putStrLn ("error occured while calling service " ++ (displayException e))
@@ -122,15 +128,18 @@ callNewsService req@(ServiceRequest _ _ _ _ op) = do
     modifyRequest =
         setRequestQueryString (getQueryString req) . setRequestMethod (B.pack "GET")
     
-    getApiKeyHeader = fromMaybe "temp_key" (unsafePerformIO $ lookupEnv "SERVICE_API_KEY")
+    getApiKeyHeader = fromMaybe "f9d85498269b1dfb5e1c5f55ca07320c" (unsafePerformIO $ lookupEnv "SERVICE_API_KEY")
     
-    getQueryString (ServiceRequest mTitle mAuthor mContains mCount _) =
-        let q = intercalate (pack " AND ") $ catMaybes [mTitle, mAuthor, mContains]
-        in [(B.pack "q" , Just $ encodeUtf8 q)
+    getQueryString (ServiceRequest mTitle mAuthor mContains mCount _) = do
+        let (inQuery, query) = unzip $ catMaybes [(,) "title" <$> mTitle, (,) "description" <$> mAuthor, (,) "description" <$> mContains]
+        let q = intercalate (pack " AND ") query
+            inQ = bool (Just $ intercalate "," inQuery) Nothing $ Prelude.null inQuery
+        [(B.pack "q" , Just $ encodeUtf8 q)
             , (B.pack "apikey" , Just $ B.pack getApiKeyHeader)
             , (B.pack "lang", Just $ B.pack "en")
             , (B.pack "max" , B.pack . show <$> mCount)
-            ] -- add in query
+            , (B.pack "in", encodeUtf8 <$> inQ)
+            ]
     
-    serviceUrl "SEARCH" = "https://gnews.io/api/v4/search"
+    serviceUrl "SEARCH" = "https://gnews.io/api/v4/search?sortby=relevance"
     serviceUrl _        = "https://gnews.io/api/v4/top-headlines?category=general"
